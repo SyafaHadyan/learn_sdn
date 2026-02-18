@@ -1,16 +1,16 @@
-from ryu.base import app_manager
-from ryu.controller import ofp_event
-from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
-from ryu.controller.handler import set_ev_cls
-from ryu.ofproto import ofproto_v1_3
-from ryu.lib.mac import haddr_to_bin
-from ryu.lib.packet import packet
-from ryu.lib.packet import ethernet
-from ryu.lib.packet import ether_types
-from ryu.lib import mac
-from ryu.topology.api import get_switch, get_link
-from ryu.app.wsgi import ControllerBase
-from ryu.topology import event, switches
+from os_ken.base import app_manager
+from os_ken.controller import ofp_event
+from os_ken.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
+from os_ken.controller.handler import set_ev_cls
+from os_ken.ofproto import ofproto_v1_3
+from os_ken.lib.mac import haddr_to_bin
+from os_ken.lib.packet import packet
+from os_ken.lib.packet import ethernet
+from os_ken.lib.packet import ether_types
+from os_ken.lib import mac
+from os_ken.topology.api import get_switch, get_link
+from os_ken.app.wsgi import ControllerBase
+from os_ken.topology import event, switches
 from collections import defaultdict
 
 # switches
@@ -102,7 +102,7 @@ def get_path (src, dst, first_port, final_port):
     r.append((dst, in_port, final_port))
     return r
 
-class DijkstraSwitch(app_manager.RyuApp):
+class DijkstraSwitch(app_manager.OSKenApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
     def __init__(self, *args, **kwargs):
