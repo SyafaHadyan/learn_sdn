@@ -14,23 +14,23 @@
 # limitations under the License.
 
 
-#Reference: https://bitbucket.org/sdnhub/ryu-starter-kit/src/7a162d81f97d080c10beb15d8653a8e0eff8a469/stateless_lb.py?at=master&fileviewer=file-view-default
+#Reference: https://bitbucket.org/sdnhub/os_ken-starter-kit/src/7a162d81f97d080c10beb15d8653a8e0eff8a469/stateless_lb.py?at=master&fileviewer=file-view-default
 
 import random
-from ryu.base import app_manager
-from ryu.controller import ofp_event
-from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
-from ryu.controller.handler import set_ev_cls
-from ryu.ofproto import ofproto_v1_3
-from ryu.lib.packet import packet
-from ryu.lib.packet import ethernet
-from ryu.lib.packet import ether_types, arp, tcp, ipv4, icmp
-from ryu.ofproto import ether, inet
-from ryu.ofproto import ofproto_v1_3
-#from ryu.app.sdnhub_apps import learning_switch
+from os_ken.base import app_manager
+from os_ken.controller import ofp_event
+from os_ken.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
+from os_ken.controller.handler import set_ev_cls
+from os_ken.ofproto import ofproto_v1_3
+from os_ken.lib.packet import packet
+from os_ken.lib.packet import ethernet
+from os_ken.lib.packet import ether_types, arp, tcp, ipv4, icmp
+from os_ken.ofproto import ether, inet
+from os_ken.ofproto import ofproto_v1_3
+#from os_ken.app.sdnhub_apps import learning_switch
 
     
-class SimpleSwitch13(app_manager.RyuApp):
+class SimpleSwitch13(app_manager.OSKenApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
     def __init__(self, *args, **kwargs):

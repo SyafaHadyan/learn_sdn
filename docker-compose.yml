@@ -1,0 +1,45 @@
+services:
+  learn_sdn:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        MININET_VERSION: master
+    image: learn_sdn:latest
+    container_name: learn_sdn    
+    privileged: true
+    stdin_open: true
+    tty: true    
+    network_mode: "host"
+    hostname: "learn_sdn"    
+    cap_add:
+      - NET_ADMIN        # Required for network namespace management
+      - SYS_ADMIN        # Required for mount namespace operations
+    
+    extra_hosts:
+      mniplab: "127.0.1.1"
+      host.docker.internal: "host-gateway"
+    
+    volumes:
+      # Read-only kernel modules for network operations
+      - /lib/modules:/lib/modules:ro
+      # Project directory for lab configurations and examples
+      - ./:/learn_sdn:rw
+    
+    environment:
+      - MININET_DOCKER=true
+      - PYTHONUNBUFFERED=1
+      - DEBIAN_FRONTEND=noninteractive
+      - WEB_UI_HOST=0.0.0.0
+      - WEB_UI_PORT=8050
+    
+    # Restart policy for high availability
+    restart: unless-stopped
+    
+    # Health check to monitor service status
+    healthcheck:
+      test: ["CMD", "ovs-vsctl", "show"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
