@@ -1,132 +1,236 @@
-"""Dijkstra SPF controller (OS-Ken).
-This controller implements Dijkstra's algorithm to find the shortest path between two hosts in a network. It listens for packet-in events and topology changes, and updates the flow tables of the switches accordingly.
-The controller maintains a list of known switches, a mapping of host MAC addresses to their corresponding switch and port, and an adjacency map of the switches. When a packet-in event occurs, it checks
-"""
+"""Dijkstra SPF controller for OSKen."""
+
+try:
+    import warnings
+    warnings.simplefilter('ignore', DeprecationWarning)
+    import eventlet
+    eventlet.monkey_patch()
+except ImportError:
+    pass
+
+import time
 
 from os_ken.base import app_manager
 from os_ken.controller import ofp_event
 from os_ken.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
 from os_ken.controller.handler import set_ev_cls
 from os_ken.ofproto import ofproto_v1_3
-from os_ken.lib.mac import haddr_to_bin
 from os_ken.lib.packet import packet
 from os_ken.lib.packet import ethernet
 from os_ken.lib.packet import ether_types
-from os_ken.lib import mac
 from os_ken.topology.api import get_switch, get_link
-from os_ken.topology import event, switches
+from os_ken.topology import event
 from collections import defaultdict
 
-# switches
-switches = []
-
-# mymacs[srcmac]->(switch, port)
-mymacs = {}
-
-# adjacency map [sw1][sw2]->port from sw1 to sw2
-adjacency = defaultdict(lambda:defaultdict(lambda:None))
-
-
-# getting the node with lowest distance in Q
-def minimum_distance(distance, Q):
-    node = None
-    min_val = float('Inf')
-    for v in Q:
-        d = distance.get(v, float('Inf'))
-        if d < min_val:
-            min_val = d
-            node = v
-    return node
-
-def get_path (src, dst, first_port, final_port):
-    # executing Dijkstra's algorithm (silent)
-    
-    # defining dictionaries for saving each node's distance and its previous node in the path from first node to that node
-    distance = {}
-    previous = {}
-
-    # setting initial distance of every node to infinity
-    for dpid in switches:
-        distance[dpid] = float('Inf')
-        previous[dpid] = None
-
-    # setting distance of the source to 0
-    distance[src] = 0
-
-    # creating a set of all nodes
-    Q = set(switches)
-
-    # checking for all undiscovered nodes whether there is a path that goes through them to their adjacent nodes which will make its adjacent nodes closer to src
-    while len(Q) > 0:
-        # getting the closest node to src among undiscovered nodes
-        u = minimum_distance(distance, Q)
-        if u is None:
-            break
-        # removing the node from Q
-        Q.remove(u)
-        # calculate minimum distance for all adjacent nodes to u
-        for p in switches:
-            # if u and other switches are adjacent
-            if adjacency[u][p] != None:
-                # setting the weight to 1 so that we count the number of routers in the path
-                w = 1
-                # if the path via u to p has lower cost then make the cost equal to this new path's cost
-                if distance[u] + w < distance[p]:
-                    distance[p] = distance[u] + w
-                    previous[p] = u
-
-    # creating a list of switches between src and dst which are in the shortest path obtained by Dijkstra's algorithm reversely
-    r = []
-    p = dst
-    r.append(p)
-    # set q to the last node before dst 
-    q = previous[p]
-    while q is not None:
-        if q == src:
-            r.append(q)
-            break
-        p = q
-        r.append(p)
-        q = previous[p]
-
-    # reversing r as it was from dst to src
-    r.reverse()
-
-    # setting path 
-    if src == dst:
-        path=[src]
-    else:
-        path=r
-
-    # Now adding in_port and out_port to the path
-    r = []
-    in_port = first_port
-    for s1, s2 in zip(path[:-1], path[1:]):
-        out_port = adjacency[s1][s2]
-        r.append((s1, in_port, out_port))
-        in_port = adjacency[s2][s1]
-    r.append((dst, in_port, final_port))
-    return r
+SPF_FLOW_COOKIE = 0x5346500000000001
+SPF_FLOW_COOKIE_MASK = 0xFFFFFFFFFFFFFFFF
+SPF_FLOW_PRIORITY = 100
+TABLE_MISS_PRIORITY = 0
+HOST_STALE_SECONDS = 300
 
 class DijkstraSwitch(app_manager.OSKenApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
+    TOPOLOGY_EVENTS = [
+        event.EventSwitchEnter,
+        event.EventSwitchLeave,
+        event.EventPortAdd,
+        event.EventPortDelete,
+        event.EventPortModify,
+        event.EventLinkAdd,
+        event.EventLinkDelete,
+    ]
 
     def __init__(self, *args, **kwargs):
         super(DijkstraSwitch, self).__init__(*args, **kwargs)
         self.topology_api_app = self
         self.datapath_list = []
+        self.datapaths = {}
         self.switches = []
         self.mymacs = {}
-        # reference to module-level adjacency structure
-        self.adjacency = adjacency
+        self.host_last_seen = {}
+        self.adjacency = defaultdict(lambda: defaultdict(lambda: None))
         self.mylinks = []
-        # keep last installed paths to avoid noisy re-install logging
+        self.topology_signature = None
         self.installed_paths = {}
+        self.broadcast_tree = {}
+        self.access_ports = defaultdict(set)
+
+    def _switch_name(self, dpid):
+        return f"s{dpid}"
+
+    def _format_path(self, path_tuples):
+        if not path_tuples:
+            return "(empty path)"
+        return " -> ".join(self._switch_name(sw) for sw, _, _ in path_tuples)
+
+    def _format_switches(self, switch_list):
+        if not switch_list:
+            return "(no switches)"
+        names = ", ".join(self._switch_name(s) for s in switch_list)
+        dpids = ", ".join(str(s) for s in switch_list)
+        return f"{names} (DPIDs: {dpids})"
+
+    def _topology_signature_for(self, switches_list, links_list):
+        return tuple(sorted(switches_list)), tuple(sorted(links_list))
+
+    def _learn_host(self, mac_addr, dpid, port_no):
+        self.mymacs[mac_addr] = (dpid, port_no)
+        self.host_last_seen[mac_addr] = time.time()
+
+    def _is_access_port(self, dpid, port_no):
+        return port_no in self.access_ports.get(dpid, set())
+
+    def _install_unicast_flow(self, datapath, in_port, out_port, src_mac, dst_mac):
+        parser = datapath.ofproto_parser
+        ofproto = datapath.ofproto
+        match = parser.OFPMatch(in_port=in_port, eth_src=src_mac, eth_dst=dst_mac)
+        actions = [parser.OFPActionOutput(out_port)]
+        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
+
+        delete_mod = parser.OFPFlowMod(
+            datapath=datapath,
+            cookie=SPF_FLOW_COOKIE,
+            cookie_mask=SPF_FLOW_COOKIE_MASK,
+            command=ofproto.OFPFC_DELETE_STRICT,
+            out_port=ofproto.OFPP_ANY,
+            out_group=ofproto.OFPG_ANY,
+            priority=SPF_FLOW_PRIORITY,
+            match=match,
+        )
+        datapath.send_msg(delete_mod)
+
+        add_mod = parser.OFPFlowMod(
+            datapath=datapath,
+            cookie=SPF_FLOW_COOKIE,
+            command=ofproto.OFPFC_ADD,
+            idle_timeout=0,
+            hard_timeout=0,
+            priority=SPF_FLOW_PRIORITY,
+            match=match,
+            instructions=inst,
+        )
+        datapath.send_msg(add_mod)
+
+    def _purge_stale_hosts(self):
+        now = time.time()
+        stale = [mac_addr for mac_addr, last_seen in self.host_last_seen.items()
+                 if now - last_seen > HOST_STALE_SECONDS]
+        for mac_addr in stale:
+            self.mymacs.pop(mac_addr, None)
+            self.host_last_seen.pop(mac_addr, None)
+            for route_key in list(self.installed_paths.keys()):
+                if mac_addr in route_key:
+                    self.installed_paths.pop(route_key, None)
+
+    def _active_hosts(self):
+        self._purge_stale_hosts()
+        return sorted(self.mymacs.keys())
+
+    def _delete_spf_flows(self, datapath):
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        mod = parser.OFPFlowMod(
+            datapath=datapath,
+            cookie=SPF_FLOW_COOKIE,
+            cookie_mask=SPF_FLOW_COOKIE_MASK,
+            command=ofproto.OFPFC_DELETE,
+            out_port=ofproto.OFPP_ANY,
+            out_group=ofproto.OFPG_ANY,
+            match=parser.OFPMatch(),
+        )
+        datapath.send_msg(mod)
+
+    def _flush_all_spf_flows(self):
+        for datapath in self.datapaths.values():
+            self._delete_spf_flows(datapath)
+        self.installed_paths.clear()
+
+    def _reinstall_all_known_routes(self):
+        known_hosts = self._active_hosts()
+        installed = 0
+        for src_mac in known_hosts:
+            for dst_mac in known_hosts:
+                if src_mac == dst_mac:
+                    continue
+                src_loc = self.mymacs.get(src_mac)
+                dst_loc = self.mymacs.get(dst_mac)
+                if src_loc is None or dst_loc is None:
+                    continue
+                path = self.compute_path(src_loc[0], dst_loc[0], src_loc[1], dst_loc[1])
+                if path:
+                    self.install_path(path, src_mac, dst_mac)
+                    installed += 1
+        self.logger.info("[TOPO] proactive route refresh completed: %d host-pair route(s) installed", installed)
+
+    def _build_broadcast_tree(self):
+        if not self.switches:
+            self.broadcast_tree = {}
+            return
+
+        root = min(self.switches)
+        distance = {dpid: float('Inf') for dpid in self.switches}
+        previous = {dpid: None for dpid in self.switches}
+        distance[root] = 0
+        remaining = set(self.switches)
+
+        while remaining:
+            current = self.minimum_distance(distance, remaining)
+            if current is None:
+                break
+            remaining.remove(current)
+            if distance[current] == float('Inf'):
+                break
+
+            for neighbor in sorted(self.switches):
+                if self.adjacency[current][neighbor] is None:
+                    continue
+                alt = distance[current] + 1
+                if alt < distance[neighbor] or (alt == distance[neighbor] and (previous[neighbor] is None or current < previous[neighbor])):
+                    distance[neighbor] = alt
+                    previous[neighbor] = current
+
+        tree = defaultdict(set)
+        for node in self.switches:
+            parent = previous[node]
+            if parent is not None:
+                tree[parent].add(node)
+                tree[node].add(parent)
+
+        self.broadcast_tree = {node: sorted(neighbors) for node, neighbors in tree.items()}
+
+    def _flood_over_tree(self, datapath, in_port, data, buffer_id):
+        parser = datapath.ofproto_parser
+        out_ports = []
+
+        if self.broadcast_tree:
+            for neighbor in self.broadcast_tree.get(datapath.id, []):
+                out_port = self.adjacency[datapath.id][neighbor]
+                if out_port is not None and out_port != in_port:
+                    out_ports.append(out_port)
+
+        for access_port in sorted(self.access_ports.get(datapath.id, set())):
+            if access_port != in_port:
+                out_ports.append(access_port)
+
+        if not out_ports:
+            self.logger.debug("[PKT-DROP] s%d: no controlled flood ports available", datapath.id)
+            return
+
+        actions = [parser.OFPActionOutput(port_no) for port_no in sorted(set(out_ports))]
+        data_arg = None if buffer_id != datapath.ofproto.OFP_NO_BUFFER else data
+        out = parser.OFPPacketOut(
+            datapath=datapath,
+            buffer_id=buffer_id,
+            in_port=in_port,
+            actions=actions,
+            data=data_arg,
+        )
+        datapath.send_msg(out)
 
     def minimum_distance(self, distance, Q):
         node = None
         min_val = float('Inf')
-        for v in Q:
+        for v in sorted(Q):
             d = distance.get(v, float('Inf'))
             if d < min_val:
                 min_val = d
@@ -134,7 +238,9 @@ class DijkstraSwitch(app_manager.OSKenApp):
         return node
 
     def compute_path(self, src, dst, first_port, final_port):
-        # Dijkstra using current topology stored in self.switches and self.adjacency (silent)
+        if src not in self.switches or dst not in self.switches:
+            return []
+
         distance = {}
         previous = {}
 
@@ -150,173 +256,159 @@ class DijkstraSwitch(app_manager.OSKenApp):
             if u is None:
                 break
             Q.remove(u)
+            if distance[u] == float('Inf'):
+                break
             for p in self.switches:
                 if self.adjacency[u][p] is not None:
                     w = 1
-                    if distance[u] + w < distance[p]:
-                        distance[p] = distance[u] + w
+                    alt = distance[u] + w
+                    if alt < distance[p] or (alt == distance[p] and (previous[p] is None or u < previous[p])):
+                        distance[p] = alt
                         previous[p] = u
 
-        # build path from src to dst
-        r = []
-        p = dst
-        r.append(p)
-        q = previous.get(p)
-        while q is not None:
-            if q == src:
-                r.append(q)
-                break
-            p = q
-            r.append(p)
-            q = previous.get(p)
-
-        r.reverse()
+        if src != dst and distance.get(dst, float('Inf')) == float('Inf'):
+            return []
 
         if src == dst:
-            path = [src]
-        else:
-            path = r
+            return [(src, first_port, final_port)]
 
-        # attach in_port/out_port info
+        path_nodes = [dst]
+        current = previous.get(dst)
+        while current is not None:
+            path_nodes.append(current)
+            if current == src:
+                break
+            current = previous.get(current)
+
+        if not path_nodes or path_nodes[-1] != src:
+            return []
+
+        path_nodes.reverse()
+
         result = []
         in_port = first_port
-        for s1, s2 in zip(path[:-1], path[1:]):
+        for s1, s2 in zip(path_nodes[:-1], path_nodes[1:]):
             out_port = self.adjacency[s1][s2]
+            if out_port is None:
+                return []
             result.append((s1, in_port, out_port))
             in_port = self.adjacency[s2][s1]
+            if in_port is None and s2 != dst:
+                return []
+
         result.append((dst, in_port, final_port))
         return result
 
     def install_path(self, p, src_mac, dst_mac):
         key = (src_mac, dst_mac)
-        # suppress logging if same path already installed
         last = self.installed_paths.get(key)
         if last == p:
             return
-        self.installed_paths[key] = p
-        # only log when path spans multiple switches (multi-hop paths)
-        if len(p) > 1:
-            path_str = ' -> '.join(str(sw) for sw, _, _ in p)
-            print(f"[FLOW-INSTALL] {src_mac} -> {dst_mac}: installed path {path_str}")
-        # adding path to flow table of each switch inside the shortest path
-        for sw, in_port, out_port in p:
-            # get the datapath for this switch
-            datapath = next((dp for dp in self.datapath_list if dp.id == int(sw)), None)
-            if datapath is None:
-                print(f"Warning: datapath with id {sw} not found in datapath_list")
-                continue
-            parser = datapath.ofproto_parser
-            ofproto = datapath.ofproto
-            # setting match part of the flow table
-            match = parser.OFPMatch(in_port=in_port, eth_src=src_mac, eth_dst=dst_mac)
-            # setting actions part of the flow table
-            actions = [parser.OFPActionOutput(out_port)]
-            # getting instructions based on the actions
-            inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS , actions)]
-            # remove any existing flow matching this 5-tuple (in_port, eth_src, eth_dst)
-            delete_mod = datapath.ofproto_parser.OFPFlowMod(datapath=datapath, match=match,
-                                                           command=ofproto.OFPFC_DELETE,
-                                                           out_port=ofproto.OFPP_ANY, out_group=ofproto.OFPG_ANY,
-                                                           priority=1)
-            datapath.send_msg(delete_mod)
-            # add new flow
-            mod = datapath.ofproto_parser.OFPFlowMod(datapath=datapath, match=match, idle_timeout=10, hard_timeout=30,
-                                                     priority=1, instructions=inst)
-            datapath.send_msg(mod)
 
-        # Install reverse flows (dst -> src) immediately to avoid early packet loss
-        for sw, in_port, out_port in reversed(p):
-            rev_datapath = next((dp for dp in self.datapath_list if dp.id == int(sw)), None)
-            if rev_datapath is None:
-                print(f"Warning: datapath with id {sw} not found when installing reverse flow")
+        self.installed_paths[key] = p
+        if len(p) > 1:
+            self.logger.debug("[FLOW-INSTALL] %s -> %s: %s", src_mac, dst_mac, self._format_path(p))
+
+        for sw, in_port, out_port in p:
+            datapath = self.datapaths.get(int(sw))
+            if datapath is None:
+                self.logger.warning("datapath with id %s not found in datapath list", sw)
                 continue
-            rev_parser = rev_datapath.ofproto_parser
-            rev_ofproto = rev_datapath.ofproto
-            # reverse match: packet arrives from the forward out_port and should be sent to forward in_port
+            self._install_unicast_flow(datapath, in_port, out_port, src_mac, dst_mac)
+
+        for sw, in_port, out_port in reversed(p):
+            rev_datapath = self.datapaths.get(int(sw))
+            if rev_datapath is None:
+                self.logger.warning("datapath with id %s not found when installing reverse flow", sw)
+                continue
             rev_in = out_port
             rev_out = in_port
-            # match reversed src/dst
-            rev_match = rev_parser.OFPMatch(in_port=rev_in, eth_src=dst_mac, eth_dst=src_mac)
-            rev_actions = [rev_parser.OFPActionOutput(rev_out)]
-            rev_inst = [rev_parser.OFPInstructionActions(rev_ofproto.OFPIT_APPLY_ACTIONS, rev_actions)]
-            # remove existing reverse flow then add
-            rev_delete = rev_datapath.ofproto_parser.OFPFlowMod(datapath=rev_datapath, match=rev_match,
-                                                                command=rev_ofproto.OFPFC_DELETE,
-                                                                out_port=rev_ofproto.OFPP_ANY, out_group=rev_ofproto.OFPG_ANY,
-                                                                priority=1)
-            rev_datapath.send_msg(rev_delete)
-            rev_mod = rev_datapath.ofproto_parser.OFPFlowMod(datapath=rev_datapath, match=rev_match,
-                                                            idle_timeout=10, hard_timeout=30,
-                                                            priority=1, instructions=rev_inst)
-            rev_datapath.send_msg(rev_mod)
-        # done
+            self._install_unicast_flow(rev_datapath, rev_in, rev_out, dst_mac, src_mac)
 
-    # defining event handler for setup and configuring of switches
-    @set_ev_cls(ofp_event.EventOFPSwitchFeatures , CONFIG_DISPATCHER)
-    def switch_features_handler(self , ev):
-        # print("switch_features_handler function is called")
-        # getting the datapath, ofproto and parser objects of the event
+    @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
+    def switch_features_handler(self, ev):
         datapath = ev.msg.datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
-        # setting match condition to nothing so that it will match to anything
         match = parser.OFPMatch()
-        # setting action to send packets to OpenFlow Controller without buffering
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
-        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS , actions)]
-        # setting the priority to 0 so that it will be that last entry to match any packet inside any flow table
+        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
         mod = datapath.ofproto_parser.OFPFlowMod(
-                            datapath=datapath, match=match, cookie=0,
-                            command=ofproto.OFPFC_ADD, idle_timeout=0, hard_timeout=0,
-                            priority=0, instructions=inst)
-        # finalizing the mod 
+            datapath=datapath,
+            match=match,
+            cookie=0,
+            command=ofproto.OFPFC_ADD,
+            idle_timeout=0,
+            hard_timeout=0,
+            priority=TABLE_MISS_PRIORITY,
+            instructions=inst,
+        )
         datapath.send_msg(mod)
 
-    # defining an event handler for packets coming to switches event
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
-        # getting msg, datapath, ofproto and parser objects
         msg = ev.msg
         datapath = msg.datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
-        # getting the port switch received the packet with
         in_port = msg.match['in_port']
-        # creating a packet encoder/decoder class with the raw data obtained by msg
         pkt = packet.Packet(msg.data)
-        # getting the protocl that matches the received packet
         eth = pkt.get_protocol(ethernet.ethernet)
 
-        # avoid broadcasts from LLDP 
-        if eth.ethertype == 35020 or eth.ethertype == 34525:
+        if eth.ethertype == ether_types.ETH_TYPE_LLDP:
             return
 
-        # getting source and destination of the link
         dst = eth.dst
         src = eth.src
         dpid = datapath.id
-        # print(f"Packet-In detected for SRC: {src} to DST: {dst} on SWITCH DPID: {dpid}")
 
-        # add the host to the mymacs of the first switch that gets the packet
-        if src not in self.mymacs.keys():
-            self.mymacs[src] = (dpid, in_port)
-            print(f"[HOST-LEARN] MAC {src} discovered at switch {dpid} port {in_port}")
+        if self._is_access_port(dpid, in_port):
+            if src not in self.mymacs:
+                self._learn_host(src, dpid, in_port)
+                self.logger.info("[HOST-LEARN] MAC %s discovered at switch %d port %d", src, dpid, in_port)
+            else:
+                learned_dpid, learned_port = self.mymacs[src]
+                if learned_dpid != dpid or learned_port != in_port:
+                    self._learn_host(src, dpid, in_port)
+                    self.logger.info("[HOST-LEARN] MAC %s moved to switch %d port %d", src, dpid, in_port)
+                else:
+                    self.host_last_seen[src] = time.time()
 
-        # finding shortest path if destination exists in mymacs
-        if dst in self.mymacs.keys():
-            # Destination known: compute shortest path and install flows
-            p = self.compute_path(self.mymacs[src][0], self.mymacs[dst][0], self.mymacs[src][1], self.mymacs[dst][1])
-            print(f"[PKT-FWD] {src} -> {dst}: path computed with {len(p)} hop(s)")
-            self.install_path(p, src, dst)
-            out_port = p[0][2]
+        if src not in self.mymacs:
+            self.logger.debug("[PKT-DROP] %s -> %s: source host not learned on an access port", src, dst)
+            return
+
+        if dst in self.mymacs:
+            src_sw, src_port = self.mymacs[src]
+            dst_sw, dst_port = self.mymacs[dst]
+            p = self.compute_path(src_sw, dst_sw, src_port, dst_port)
+            if p:
+                self.logger.debug(
+                    "[PATH] %s at s%d:p%d -> %s at s%d:p%d: %s",
+                    src,
+                    src_sw,
+                    src_port,
+                    dst,
+                    dst_sw,
+                    dst_port,
+                    p,
+                )
+                self.logger.debug("[PKT-FWD] %s -> %s: path computed with %d hop(s)", src, dst, len(p))
+                self.install_path(p, src, dst)
+                out_port = p[0][2]
+            else:
+                self.logger.warning("[PKT-DROP] %s -> %s: no path available in current topology", src, dst)
+                return
         else:
-            # Destination unknown: fall back to flooding
-            print(f"[PKT-FLOOD] {src} -> {dst}: destination unknown, flooding")
-            out_port = ofproto.OFPP_FLOOD
+            self.logger.debug(
+                "[PKT-FLOOD] %s -> %s: destination unknown, controlled flood over broadcast tree",
+                src,
+                dst,
+            )
+            self._flood_over_tree(datapath, in_port, msg.data, msg.buffer_id)
+            return
 
-        # getting actions part of the flow table
         actions = [parser.OFPActionOutput(out_port)]
-
         data = None
         if msg.buffer_id == ofproto.OFP_NO_BUFFER:
             data = msg.data
@@ -324,64 +416,78 @@ class DijkstraSwitch(app_manager.OSKenApp):
                                   actions=actions, data=data)
         datapath.send_msg(out)
 
-    # defining an event handler for adding/deleting of switches, hosts, ports and links event
-    events = [event.EventSwitchEnter,
-              event.EventSwitchLeave, event.EventPortAdd,
-              event.EventPortDelete, event.EventPortModify,
-              event.EventLinkAdd, event.EventLinkDelete]
-    @set_ev_cls(events)
+    @set_ev_cls(TOPOLOGY_EVENTS)
     def get_topology_data(self, ev):
-        global switches
-        global mylinks
-        global adjacency
-        # print("get_topology_data is called.")
-        # getting the list of known switches 
-        switch_list = get_switch(self.topology_api_app, None)  
-        switches = [switch.dp.id for switch in switch_list]
-        # keep instance switch list in sync with topology
-        self.switches = switches
-        # print("current known switches=", switches)
-        # getting the list of datapaths from the list of switches
-        self.datapath_list = [switch.dp for switch in switch_list]
-        # sorting the datapath list based on their id so that indexing them in install_function will be correct
-        self.datapath_list.sort(key=lambda dp: dp.id)
-
-        # getting the list of links between switches
+        switch_list = get_switch(self.topology_api_app, None)
+        switch_ids = sorted(switch.dp.id for switch in switch_list)
         links_list = get_link(self.topology_api_app, None)
-        new_mylinks = [(link.src.dpid, link.dst.dpid, link.src.port_no, link.dst.port_no) for link in links_list]
+        new_mylinks = sorted(
+            (link.src.dpid, link.dst.dpid, link.src.port_no, link.dst.port_no)
+            for link in links_list
+        )
 
-        # reset adjacency cleanly and repopulate
-        adjacency = defaultdict(lambda:defaultdict(lambda:None))
-        self.adjacency = adjacency
+        if not new_mylinks:
+            if self.topology_signature is not None:
+                self.logger.debug("[TOPO] ignoring transient empty topology snapshot")
+            return
+
+        self.switches = switch_ids
+        self.datapath_list = [switch.dp for switch in switch_list]
+        self.datapath_list.sort(key=lambda dp: dp.id)
+        self.datapaths = {dp.id: dp for dp in self.datapath_list}
+
+        self.access_ports = defaultdict(set)
+        for switch in switch_list:
+            all_ports = {port.port_no for port in getattr(switch, 'ports', [])}
+            inter_switch_ports = set()
+            for link in links_list:
+                if link.src.dpid == switch.dp.id:
+                    inter_switch_ports.add(link.src.port_no)
+                if link.dst.dpid == switch.dp.id:
+                    inter_switch_ports.add(link.dst.port_no)
+            self.access_ports[switch.dp.id] = all_ports - inter_switch_ports
+
+        new_adjacency = defaultdict(lambda: defaultdict(lambda: None))
         for s1, s2, port1, port2 in new_mylinks:
-            adjacency[s1][s2] = port1
-            adjacency[s2][s1] = port2
+            new_adjacency[s1][s2] = port1
+            new_adjacency[s2][s1] = port2
 
-        # If links changed, recompute paths for known hosts
-        if new_mylinks != getattr(self, 'mylinks', []):
-            # compute added/removed links for logging
-            old_set = set(getattr(self, 'mylinks', []))
-            new_set = set(new_mylinks)
-            added = new_set - old_set
-            removed = old_set - new_set
-            if added:
-                print(f"[TOPO-CHANGE] Link up: {[(s1, s2) for s1, s2, _, _ in added]}")
-            if removed:
-                print(f"[TOPO-CHANGE] Link down: {[(s1, s2) for s1, s2, _, _ in removed]}")
+        old_signature = self.topology_signature
+        new_signature = self._topology_signature_for(self.switches, new_mylinks)
+        self.adjacency = new_adjacency
+        self.mylinks = new_mylinks
 
-            self.mylinks = new_mylinks
-            macs = list(self.mymacs.keys())
-            for src_mac in macs:
-                for dst_mac in macs:
-                    if src_mac == dst_mac:
-                        continue
-                    try:
-                        src_sw, src_port = self.mymacs[src_mac]
-                        dst_sw, dst_port = self.mymacs[dst_mac]
-                    except Exception:
-                        continue
-                    # compute and install new path
-                    p = self.compute_path(src_sw, dst_sw, src_port, dst_port)
-                    if p:
-                        print(f"[PKT-FWD] {src_mac} -> {dst_mac}: path computed with {len(p)} hop(s)")
-                        self.install_path(p, src_mac, dst_mac)
+        if old_signature != new_signature:
+            if old_signature is not None:
+                _, old_links = old_signature
+                old_link_set = set(old_links)
+                new_link_set = set(new_mylinks)
+                added = sorted(new_link_set - old_link_set)
+                removed = sorted(old_link_set - new_link_set)
+                if added:
+                    self.logger.info("[TOPO-CHANGE] link up: %s", [(s1, s2) for s1, s2, _, _ in added])
+                if removed:
+                    self.logger.info("[TOPO-CHANGE] link down: %s", [(s1, s2) for s1, s2, _, _ in removed])
+                self.logger.info(
+                    "[TOPO] refreshed topology: %d switch(es), %d link(s)",
+                    len(self.switches),
+                    len(new_mylinks),
+                )
+                self._flush_all_spf_flows()
+                self._reinstall_all_known_routes()
+
+            self.topology_signature = new_signature
+            self._build_broadcast_tree()
+
+if __name__ == '__main__':
+    import os
+    import sys
+
+    current_file = os.path.abspath(__file__)
+    passthrough_args = sys.argv[1:]
+    if '--observe-links' not in passthrough_args:
+        passthrough_args = ['--observe-links'] + passthrough_args
+    sys.argv = ['dijkstra_osken_controller', *passthrough_args, current_file]
+
+    from os_ken.cmd.manager import main
+    sys.exit(main())
