@@ -1,4 +1,8 @@
-"""Dijkstra SPF controller for OSKen."""
+"""Shortest Path Forwarding (SPF) OpenFlow controller using Dijkstra's algorithm.
+
+Computes and installs optimal paths on switches, with broadcast tree flooding for unknown destinations.
+Complexity: O((V+E) log V) per SPF computation.
+"""
 
 try:
     import warnings
@@ -9,6 +13,9 @@ except ImportError:
     pass
 
 import time
+import heapq
+import signal
+import sys
 
 from os_ken.base import app_manager
 from os_ken.controller import ofp_event
@@ -28,6 +35,13 @@ SPF_FLOW_PRIORITY = 100
 TABLE_MISS_PRIORITY = 0
 HOST_STALE_SECONDS = 300
 
+def _handle_sigint(signum, frame):
+    """Handle SIGINT (Ctrl+C) by gracefully stopping OSKen."""
+    print("\n[SIGNAL] SIGINT received, initiating graceful shutdown...", file=sys.stderr, flush=True)
+    app_manager.AppManager.stop()
+
+signal.signal(signal.SIGINT, _handle_sigint)
+
 class DijkstraSwitch(app_manager.OSKenApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
     TOPOLOGY_EVENTS = [
@@ -42,14 +56,12 @@ class DijkstraSwitch(app_manager.OSKenApp):
 
     def __init__(self, *args, **kwargs):
         super(DijkstraSwitch, self).__init__(*args, **kwargs)
-        self.topology_api_app = self
-        self.datapath_list = []
         self.datapaths = {}
         self.switches = []
         self.mymacs = {}
         self.host_last_seen = {}
-        self.adjacency = defaultdict(lambda: defaultdict(lambda: None))
-        self.mylinks = []
+        self.adjacency = defaultdict(list)  # Maps dpid -> [(neighbor_dpid, out_port), ...]
+        self.port_map = {}  # Maps (dpid, neighbor_dpid) -> out_port for quick lookup
         self.topology_signature = None
         self.installed_paths = {}
         self.broadcast_tree = {}
@@ -63,22 +75,15 @@ class DijkstraSwitch(app_manager.OSKenApp):
             return "(empty path)"
         return " -> ".join(self._switch_name(sw) for sw, _, _ in path_tuples)
 
-    def _format_switches(self, switch_list):
-        if not switch_list:
-            return "(no switches)"
-        names = ", ".join(self._switch_name(s) for s in switch_list)
-        dpids = ", ".join(str(s) for s in switch_list)
-        return f"{names} (DPIDs: {dpids})"
-
-    def _topology_signature_for(self, switches_list, links_list):
-        return tuple(sorted(switches_list)), tuple(sorted(links_list))
-
     def _learn_host(self, mac_addr, dpid, port_no):
         self.mymacs[mac_addr] = (dpid, port_no)
         self.host_last_seen[mac_addr] = time.time()
 
     def _is_access_port(self, dpid, port_no):
         return port_no in self.access_ports.get(dpid, set())
+
+    def _get_port(self, src_dpid, dst_dpid):
+        return self.port_map.get((src_dpid, dst_dpid))
 
     def _install_unicast_flow(self, datapath, in_port, out_port, src_mac, dst_mac):
         parser = datapath.ofproto_parser
@@ -113,18 +118,55 @@ class DijkstraSwitch(app_manager.OSKenApp):
 
     def _purge_stale_hosts(self):
         now = time.time()
-        stale = [mac_addr for mac_addr, last_seen in self.host_last_seen.items()
-                 if now - last_seen > HOST_STALE_SECONDS]
-        for mac_addr in stale:
-            self.mymacs.pop(mac_addr, None)
-            self.host_last_seen.pop(mac_addr, None)
-            for route_key in list(self.installed_paths.keys()):
-                if mac_addr in route_key:
-                    self.installed_paths.pop(route_key, None)
+        stale = {mac for mac, last_seen in self.host_last_seen.items()
+                 if now - last_seen > HOST_STALE_SECONDS}
+        if not stale:
+            return
+        self.mymacs = {mac: loc for mac, loc in self.mymacs.items() if mac not in stale}
+        self.host_last_seen = {mac: t for mac, t in self.host_last_seen.items() if mac not in stale}
+        self.installed_paths = {k: v for k, v in self.installed_paths.items() 
+                                if k[0] not in stale and k[1] not in stale}
+
+    def _purge_hosts_on_departed_switches(self):
+        """Remove hosts on switches no longer in topology."""
+        current_switches = set(self.switches)
+        departed_macs = {mac for mac, (dpid, _) in self.mymacs.items() if dpid not in current_switches}
+        if not departed_macs:
+            return
+        self.logger.debug("[HOST-PURGE] removing %d host(s) from departed switches", len(departed_macs))
+        self.mymacs = {mac: loc for mac, loc in self.mymacs.items() if mac not in departed_macs}
+        self.host_last_seen = {mac: t for mac, t in self.host_last_seen.items() if mac not in departed_macs}
+        self.installed_paths = {k: v for k, v in self.installed_paths.items() 
+                                if k[0] not in departed_macs and k[1] not in departed_macs}
 
     def _active_hosts(self):
         self._purge_stale_hosts()
         return sorted(self.mymacs.keys())
+
+    def stop(self):
+        """Cleanup when controller stops."""
+        self.logger.info("[CONTROLLER-STOP] shutting down, clearing %d hosts and %d cached paths",
+                         len(self.mymacs), len(self.installed_paths))
+        self._flush_all_spf_flows()
+        self.mymacs.clear()
+        self.host_last_seen.clear()
+        self.installed_paths.clear()
+        self.broadcast_tree.clear()
+        self.datapaths.clear()
+        super(DijkstraSwitch, self).stop()
+        self.logger.info("[CONTROLLER-EXIT] cleanup complete, exiting gracefully")
+        sys.exit(0)
+
+    def _update_host_location(self, mac, dpid, port):
+        current_loc = self.mymacs.get(mac)
+        new_loc = (dpid, port)
+        if current_loc != new_loc:
+            is_new = mac not in self.mymacs
+            self._learn_host(mac, dpid, port)
+            event_type = "discovered" if is_new else "moved"
+            self.logger.info("[HOST-LEARN] MAC %s %s at switch %d port %d", mac, event_type, dpid, port)
+        else:
+            self.host_last_seen[mac] = time.time()
 
     def _delete_spf_flows(self, datapath):
         ofproto = datapath.ofproto
@@ -148,6 +190,11 @@ class DijkstraSwitch(app_manager.OSKenApp):
     def _reinstall_all_known_routes(self):
         known_hosts = self._active_hosts()
         installed = 0
+        skipped = 0
+        unreachable = 0
+        
+        self.logger.debug("[ROUTE-INSTALL] starting batch route installation for %d hosts", len(known_hosts))
+        
         for src_mac in known_hosts:
             for dst_mac in known_hosts:
                 if src_mac == dst_mac:
@@ -155,68 +202,138 @@ class DijkstraSwitch(app_manager.OSKenApp):
                 src_loc = self.mymacs.get(src_mac)
                 dst_loc = self.mymacs.get(dst_mac)
                 if src_loc is None or dst_loc is None:
+                    skipped += 1
                     continue
+                    
                 path = self.compute_path(src_loc[0], dst_loc[0], src_loc[1], dst_loc[1])
                 if path:
                     self.install_path(path, src_mac, dst_mac)
                     installed += 1
-        self.logger.info("[TOPO] proactive route refresh completed: %d host-pair route(s) installed", installed)
+                else:
+                    unreachable += 1
+                    self.logger.warning("[ROUTE-INSTALL] %s->%s: path not found (s%d->s%d)",
+                                        src_mac, dst_mac, src_loc[0], dst_loc[0])
+        
+        self.logger.info("[TOPO] proactive route refresh: installed=%d, skipped=%d, unreachable=%d, active_hosts=%d",
+                         installed, skipped, unreachable, len(known_hosts))
+
+    def _dijkstra_spf_heap(self, src, dst):
+        """Dijkstra SPF with O((V+E) log V) complexity. Returns (distance_dict, previous_dict)."""
+        if src not in self.adjacency and src not in self.switches:
+            return {}, {}
+        
+        # Initialize distances for all vertices in self.switches
+        distance = {dpid: float('inf') for dpid in self.switches}
+        previous = {dpid: None for dpid in self.switches}
+        
+        # Handle transient topology states: add any vertices in adjacency that aren't in self.switches yet
+        for u in self.adjacency:
+            distance.setdefault(u, float('inf'))
+            previous.setdefault(u, None)
+            for v, _ in self.adjacency[u]:
+                distance.setdefault(v, float('inf'))
+                previous.setdefault(v, None)
+        
+        distance[src] = 0
+        
+        # Priority queue: (distance, switch_dpid)
+        pq = [(0, src)]
+        visited = set()
+        edge_exams = 0  # Track edge examinations for statistics
+        relaxations = 0  # Track successful relaxations
+        
+        self.logger.debug("[SPF-INIT] computing shortest path: src=s%d, dst=s%d, vertices=%d, edges=%d",
+                          src, dst, len(distance), sum(len(neighbors) for neighbors in self.adjacency.values()))
+        
+        # Main Dijkstra loop
+        while pq:
+            d, u = heapq.heappop(pq)
+            
+            # Skip if already visited (handles duplicate entries in heap)
+            if u in visited:
+                self.logger.debug("[SPF-POP] s%d(dist=%d): already processed, skipping", u, d)
+                continue
+            visited.add(u)
+            
+            # Skip if we popped a stale entry
+            if d > distance[u]:
+                self.logger.debug("[SPF-POP] s%d(dist=%d): stale entry (best=%.0f), skipping", u, d, distance[u])
+                continue
+            
+            self.logger.debug("[SPF-POP] s%d(dist=%d): processing, neighbors=%d", u, d, len(self.adjacency[u]))
+            
+            # Relax edges: iterate only over actual neighbors (O(E) total, not O(V²))
+            debug_enabled = self.logger.isEnabledFor(10)  # DEBUG level = 10
+            for v, out_port in self.adjacency[u]:
+                edge_exams += 1
+                alt = distance[u] + 1  # unweighted graph, all edges weight 1
+                
+                if alt < distance[v]:
+                    relaxations += 1
+                    distance[v] = alt
+                    previous[v] = u
+                    heapq.heappush(pq, (alt, v))
+                    if debug_enabled:
+                        self.logger.debug("[SPF-RELAX] edge s%d->s%d: dist updated -> %d (port=%d)",
+                                          u, v, alt, out_port)
+                elif alt == distance[v] and (previous[v] is None or u < previous[v]):
+                    relaxations += 1
+                    previous[v] = u
+        
+        # Final results and statistics
+        reachable = sum(1 for d in distance.values() if d != float('inf'))
+        self.logger.info("[SPF-DONE] s%d->s%d: reachable=%d/%d, edge_exams=%d, relaxations=%d",
+                         src, dst, reachable, len(distance), edge_exams, relaxations)
+        
+        return distance, previous
 
     def _build_broadcast_tree(self):
+        """Build spanning tree rooted at minimum DPID switch."""
         if not self.switches:
             self.broadcast_tree = {}
             return
 
         root = min(self.switches)
-        distance = {dpid: float('Inf') for dpid in self.switches}
-        previous = {dpid: None for dpid in self.switches}
-        distance[root] = 0
-        remaining = set(self.switches)
+        self.logger.debug("[TREE-BUILD] constructing spanning tree rooted at s%d from %d switches",
+                          root, len(self.switches))
+        
+        distance, previous = self._dijkstra_spf_heap(root, root)
 
-        while remaining:
-            current = self.minimum_distance(distance, remaining)
-            if current is None:
-                break
-            remaining.remove(current)
-            if distance[current] == float('Inf'):
-                break
-
-            for neighbor in sorted(self.switches):
-                if self.adjacency[current][neighbor] is None:
-                    continue
-                alt = distance[current] + 1
-                if alt < distance[neighbor] or (alt == distance[neighbor] and (previous[neighbor] is None or current < previous[neighbor])):
-                    distance[neighbor] = alt
-                    previous[neighbor] = current
-
+        # Build tree from parent pointers (bidirectional edges)
         tree = defaultdict(set)
+        tree_edges = 0
         for node in self.switches:
             parent = previous[node]
             if parent is not None:
                 tree[parent].add(node)
                 tree[node].add(parent)
+                tree_edges += 1
+                self.logger.debug("[TREE-EDGE] s%d->s%d: tree parent-child link", parent, node)
 
-        self.broadcast_tree = {node: sorted(neighbors) for node, neighbors in tree.items()}
+        self.broadcast_tree = {node: sorted(list(neighbors)) for node, neighbors in tree.items()}
+        
+        self.logger.info("[TREE-DONE] root=s%d, tree_edges=%d, tree_diameter(hops)=%s",
+                         root, tree_edges, max(distance.values()) if distance else 0)
 
     def _flood_over_tree(self, datapath, in_port, data, buffer_id):
         parser = datapath.ofproto_parser
-        out_ports = []
-
+        out_ports_set = set()
         if self.broadcast_tree:
             for neighbor in self.broadcast_tree.get(datapath.id, []):
-                out_port = self.adjacency[datapath.id][neighbor]
+                out_port = self._get_port(datapath.id, neighbor)
                 if out_port is not None and out_port != in_port:
-                    out_ports.append(out_port)
+                    out_ports_set.add(out_port)
 
-        for access_port in sorted(self.access_ports.get(datapath.id, set())):
+        access_set = self.access_ports.get(datapath.id, set())
+        for access_port in access_set:
             if access_port != in_port:
-                out_ports.append(access_port)
+                out_ports_set.add(access_port)
 
-        if not out_ports:
+        if not out_ports_set:
             self.logger.debug("[PKT-DROP] s%d: no controlled flood ports available", datapath.id)
             return
 
-        actions = [parser.OFPActionOutput(port_no) for port_no in sorted(set(out_ports))]
+        actions = [parser.OFPActionOutput(port_no) for port_no in sorted(out_ports_set)]
         data_arg = None if buffer_id != datapath.ofproto.OFP_NO_BUFFER else data
         out = parser.OFPPacketOut(
             datapath=datapath,
@@ -227,51 +344,26 @@ class DijkstraSwitch(app_manager.OSKenApp):
         )
         datapath.send_msg(out)
 
-    def minimum_distance(self, distance, Q):
-        node = None
-        min_val = float('Inf')
-        for v in sorted(Q):
-            d = distance.get(v, float('Inf'))
-            if d < min_val:
-                min_val = d
-                node = v
-        return node
-
     def compute_path(self, src, dst, first_port, final_port):
+        """Compute shortest path. Returns list of (switch, in_port, out_port) or []. O((V+E) log V)."""
         if src not in self.switches or dst not in self.switches:
+            self.logger.warning("[PATH-QUERY] invalid endpoints: src=s%d, dst=s%d", src, dst)
             return []
 
-        distance = {}
-        previous = {}
+        self.logger.debug("[PATH-QUERY] computing path: s%d -> s%d", src, dst)
+        distance, previous = self._dijkstra_spf_heap(src, dst)
 
-        for dpid in self.switches:
-            distance[dpid] = float('Inf')
-            previous[dpid] = None
-
-        distance[src] = 0
-        Q = set(self.switches)
-
-        while len(Q) > 0:
-            u = self.minimum_distance(distance, Q)
-            if u is None:
-                break
-            Q.remove(u)
-            if distance[u] == float('Inf'):
-                break
-            for p in self.switches:
-                if self.adjacency[u][p] is not None:
-                    w = 1
-                    alt = distance[u] + w
-                    if alt < distance[p] or (alt == distance[p] and (previous[p] is None or u < previous[p])):
-                        distance[p] = alt
-                        previous[p] = u
-
-        if src != dst and distance.get(dst, float('Inf')) == float('Inf'):
+        # Check if destination is reachable
+        if src != dst and distance.get(dst, float('inf')) == float('inf'):
+            self.logger.warning("[PATH-UNREACHABLE] s%d: no path to s%d from s%d", dst, src, dst)
             return []
 
+        # Special case: same switch
         if src == dst:
+            self.logger.debug("[PATH-LOCAL] s%d: same-switch path, no forwarding needed", src)
             return [(src, first_port, final_port)]
 
+        # Reconstruct path by following previous pointers
         path_nodes = [dst]
         current = previous.get(dst)
         while current is not None:
@@ -280,23 +372,32 @@ class DijkstraSwitch(app_manager.OSKenApp):
                 break
             current = previous.get(current)
 
+        # Validate path reconstruction
         if not path_nodes or path_nodes[-1] != src:
+            self.logger.error("[PATH-CORRUPT] s%d->s%d: path reconstruction failed", src, dst)
             return []
 
         path_nodes.reverse()
+        self.logger.debug("[PATH-RECONSTRUCT] s%d->s%d: reconstructed %d-hop path: %s",
+                          src, dst, len(path_nodes) - 1, self._format_path([(sw, 0, 0) for sw in path_nodes]))
 
+        # Build result with port numbers
         result = []
         in_port = first_port
         for s1, s2 in zip(path_nodes[:-1], path_nodes[1:]):
-            out_port = self.adjacency[s1][s2]
+            out_port = self._get_port(s1, s2)
             if out_port is None:
+                self.logger.error("[PATH-PORTMAP] s%d->s%d: port mapping lost during path build", s1, s2)
                 return []
             result.append((s1, in_port, out_port))
-            in_port = self.adjacency[s2][s1]
+            in_port = self._get_port(s2, s1)
             if in_port is None and s2 != dst:
+                self.logger.error("[PATH-PORTMAP] s%d->s%d: reverse port mapping lost", s2, s1)
                 return []
 
         result.append((dst, in_port, final_port))
+        self.logger.info("[PATH-COMPUTED] s%d->s%d: %d-hop path with %d flow entries",
+                         src, dst, len(result) - 1, len(result) * 2)
         return result
 
     def install_path(self, p, src_mac, dst_mac):
@@ -306,24 +407,19 @@ class DijkstraSwitch(app_manager.OSKenApp):
             return
 
         self.installed_paths[key] = p
-        if len(p) > 1:
-            self.logger.debug("[FLOW-INSTALL] %s -> %s: %s", src_mac, dst_mac, self._format_path(p))
+        self.logger.debug("[FLOW-INSTALL] %s -> %s: %s", src_mac, dst_mac, self._format_path(p))
+        self._install_flows_both_directions(p, src_mac, dst_mac)
 
-        for sw, in_port, out_port in p:
+    def _install_flows_both_directions(self, path, src_mac, dst_mac):
+        for sw, in_port, out_port in path:
             datapath = self.datapaths.get(int(sw))
-            if datapath is None:
-                self.logger.warning("datapath with id %s not found in datapath list", sw)
-                continue
-            self._install_unicast_flow(datapath, in_port, out_port, src_mac, dst_mac)
-
-        for sw, in_port, out_port in reversed(p):
-            rev_datapath = self.datapaths.get(int(sw))
-            if rev_datapath is None:
-                self.logger.warning("datapath with id %s not found when installing reverse flow", sw)
-                continue
-            rev_in = out_port
-            rev_out = in_port
-            self._install_unicast_flow(rev_datapath, rev_in, rev_out, dst_mac, src_mac)
+            if datapath:
+                self._install_unicast_flow(datapath, in_port, out_port, src_mac, dst_mac)
+        
+        for sw, in_port, out_port in reversed(path):
+            datapath = self.datapaths.get(int(sw))
+            if datapath:
+                self._install_unicast_flow(datapath, out_port, in_port, dst_mac, src_mac)
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -363,42 +459,37 @@ class DijkstraSwitch(app_manager.OSKenApp):
         dpid = datapath.id
 
         if self._is_access_port(dpid, in_port):
-            if src not in self.mymacs:
-                self._learn_host(src, dpid, in_port)
-                self.logger.info("[HOST-LEARN] MAC %s discovered at switch %d port %d", src, dpid, in_port)
-            else:
-                learned_dpid, learned_port = self.mymacs[src]
-                if learned_dpid != dpid or learned_port != in_port:
-                    self._learn_host(src, dpid, in_port)
-                    self.logger.info("[HOST-LEARN] MAC %s moved to switch %d port %d", src, dpid, in_port)
-                else:
-                    self.host_last_seen[src] = time.time()
+            self._update_host_location(src, dpid, in_port)
 
         if src not in self.mymacs:
             self.logger.debug("[PKT-DROP] %s -> %s: source host not learned on an access port", src, dst)
             return
 
         if dst in self.mymacs:
-            src_sw, src_port = self.mymacs[src]
-            dst_sw, dst_port = self.mymacs[dst]
-            p = self.compute_path(src_sw, dst_sw, src_port, dst_port)
-            if p:
-                self.logger.debug(
-                    "[PATH] %s at s%d:p%d -> %s at s%d:p%d: %s",
-                    src,
-                    src_sw,
-                    src_port,
-                    dst,
-                    dst_sw,
-                    dst_port,
-                    p,
-                )
-                self.logger.debug("[PKT-FWD] %s -> %s: path computed with %d hop(s)", src, dst, len(p))
-                self.install_path(p, src, dst)
-                out_port = p[0][2]
+            # Check if path is already cached; only compute if needed
+            if (src, dst) in self.installed_paths:
+                p = self.installed_paths[(src, dst)]
+                # Find current switch in path and extract its output port
+                out_port = None
+                for sw, _, port in p:
+                    if sw == dpid:
+                        out_port = port
+                        break
+                if out_port is None:
+                    self.logger.warning("[PKT-DROP] %s -> %s: current switch s%d not in cached path", src, dst, dpid)
+                    return
             else:
-                self.logger.warning("[PKT-DROP] %s -> %s: no path available in current topology", src, dst)
-                return
+                src_sw, src_port = self.mymacs[src]
+                dst_sw, dst_port = self.mymacs[dst]
+                p = self.compute_path(src_sw, dst_sw, src_port, dst_port)
+                if p:
+                    self.logger.debug("[PKT-FWD] %s -> %s: path computed with %d hop(s)", src, dst, len(p))
+                    self.install_path(p, src, dst)
+                    # Current packet arrived at source, so use first element's out_port
+                    out_port = p[0][2]
+                else:
+                    self.logger.warning("[PKT-DROP] %s -> %s: no path available in current topology", src, dst)
+                    return
         else:
             self.logger.debug(
                 "[PKT-FLOOD] %s -> %s: destination unknown, controlled flood over broadcast tree",
@@ -418,9 +509,9 @@ class DijkstraSwitch(app_manager.OSKenApp):
 
     @set_ev_cls(TOPOLOGY_EVENTS)
     def get_topology_data(self, ev):
-        switch_list = get_switch(self.topology_api_app, None)
+        switch_list = get_switch(self, None)
         switch_ids = sorted(switch.dp.id for switch in switch_list)
-        links_list = get_link(self.topology_api_app, None)
+        links_list = get_link(self, None)
         new_mylinks = sorted(
             (link.src.dpid, link.dst.dpid, link.src.port_no, link.dst.port_no)
             for link in links_list
@@ -432,30 +523,32 @@ class DijkstraSwitch(app_manager.OSKenApp):
             return
 
         self.switches = switch_ids
-        self.datapath_list = [switch.dp for switch in switch_list]
-        self.datapath_list.sort(key=lambda dp: dp.id)
-        self.datapaths = {dp.id: dp for dp in self.datapath_list}
+        self.datapaths = {switch.dp.id: switch.dp for switch in switch_list}
 
+        # Build inter-switch ports in single pass: O(E) not O(N*E)
+        inter_switch_ports = defaultdict(set)
+        for s1, s2, port1, port2 in new_mylinks:
+            inter_switch_ports[s1].add(port1)
+            inter_switch_ports[s2].add(port2)
+        
+        # Compute access ports: all ports minus inter-switch ports
         self.access_ports = defaultdict(set)
         for switch in switch_list:
             all_ports = {port.port_no for port in getattr(switch, 'ports', [])}
-            inter_switch_ports = set()
-            for link in links_list:
-                if link.src.dpid == switch.dp.id:
-                    inter_switch_ports.add(link.src.port_no)
-                if link.dst.dpid == switch.dp.id:
-                    inter_switch_ports.add(link.dst.port_no)
-            self.access_ports[switch.dp.id] = all_ports - inter_switch_ports
+            self.access_ports[switch.dp.id] = all_ports - inter_switch_ports[switch.dp.id]
 
-        new_adjacency = defaultdict(lambda: defaultdict(lambda: None))
+        new_adjacency = defaultdict(list)
+        new_port_map = {}
         for s1, s2, port1, port2 in new_mylinks:
-            new_adjacency[s1][s2] = port1
-            new_adjacency[s2][s1] = port2
+            new_adjacency[s1].append((s2, port1))
+            new_adjacency[s2].append((s1, port2))
+            new_port_map[(s1, s2)] = port1
+            new_port_map[(s2, s1)] = port2
 
         old_signature = self.topology_signature
-        new_signature = self._topology_signature_for(self.switches, new_mylinks)
+        new_signature = (tuple(sorted(self.switches)), tuple(sorted(new_mylinks)))
         self.adjacency = new_adjacency
-        self.mylinks = new_mylinks
+        self.port_map = new_port_map
 
         if old_signature != new_signature:
             if old_signature is not None:
@@ -464,17 +557,30 @@ class DijkstraSwitch(app_manager.OSKenApp):
                 new_link_set = set(new_mylinks)
                 added = sorted(new_link_set - old_link_set)
                 removed = sorted(old_link_set - new_link_set)
+                
+                self.logger.info("[TOPO-SNAPSHOT] old: %d switches, %d links | new: %d switches, %d links | delta: +%d -%d",
+                                 len(old_signature[0]), len(old_links),
+                                 len(self.switches), len(new_mylinks),
+                                 len(added), len(removed))
+                
                 if added:
-                    self.logger.info("[TOPO-CHANGE] link up: %s", [(s1, s2) for s1, s2, _, _ in added])
+                    self.logger.info("[TOPO-UP] %d link(s) up: %s",
+                                     len(added), [(s1, s2) for s1, s2, _, _ in added])
                 if removed:
-                    self.logger.info("[TOPO-CHANGE] link down: %s", [(s1, s2) for s1, s2, _, _ in removed])
-                self.logger.info(
-                    "[TOPO] refreshed topology: %d switch(es), %d link(s)",
-                    len(self.switches),
-                    len(new_mylinks),
-                )
+                    self.logger.warning("[TOPO-DOWN] %d link(s) down: %s",
+                                        len(removed), [(s1, s2) for s1, s2, _, _ in removed])
+                
+                # Remove hosts on switches that departed
+                self._purge_hosts_on_departed_switches()
+                
+                self.logger.info("[TOPO-REFRESH] topology changed, flushing %d installed flows and reinstalling routes",
+                                 len(self.installed_paths))
                 self._flush_all_spf_flows()
+                self.installed_paths.clear()  # Invalidate path cache before recomputing
                 self._reinstall_all_known_routes()
+            else:
+                self.logger.info("[TOPO-INITIAL] initial topology snapshot: %d switch(es), %d link(s)",
+                                 len(self.switches), len(new_mylinks))
 
             self.topology_signature = new_signature
             self._build_broadcast_tree()
