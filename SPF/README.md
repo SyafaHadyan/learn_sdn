@@ -1,112 +1,195 @@
-# Shortest Path forwarding
-Berisikan implementasi shortest-path forwarding di OSKen (fork dari Ryu).
+# SPF Lab — Shortest-Path Forwarding with SDN
 
-Implementasi saat ini menggunakan Mode 1:
-- OSKen topology discovery (`--observe-links`) menangani LLDP dan link-state.
-- Controller SPF hanya membaca topologi dari `get_link()`/`get_switch()`.
-- Flow SPF diberi cookie khusus agar dapat dihapus dan dipasang ulang saat topologi berubah.
-- Packet yang belum punya tujuan dikenal akan dibroadcast lewat spanning broadcast tree yang dihitung oleh controller, bukan via flood bebas dari switch.
+This lab implements multiple routing algorithm controllers using
+[OSKen](https://github.com/openstack/os-ken) (an OpenFlow controller framework)
+and [Mininet](https://mininet.org/) as the virtual network emulator.
 
-1. Jalankan mininet dengan program dengan perintah pada salah satu terminal console:
+Each controller demonstrates a different path-computation algorithm running as a
+centralised SDN application.  All controllers share the same network infrastructure
+code (`base_controller.py`) and differ only in their routing algorithm.
+
+---
+
+## Contents
+
 ```
-sudo python3 topo-spf_lab.py
+SPF/
+├── algorithms/                          Pure-Python algorithm implementations
+│   ├── __init__.py
+│   ├── bfs.py                           Breadth-First Search  O(V+E)
+│   ├── dijkstra.py                      Dijkstra + multi-parent variant
+│   ├── astar.py                         A* with reverse-BFS heuristic
+│   ├── bellman_ford.py                  Bellman-Ford with negative-cycle detection
+│   ├── floyd_warshall.py                Floyd-Warshall all-pairs O(V^3)
+│   ├── widest_path.py                   Maximum-bottleneck bandwidth path
+│   └── yen_k_shortest.py                Yen's K-shortest simple paths
+│
+├── base_controller.py                   Shared SDN infrastructure (all controllers inherit)
+│
+├── bfs_osken_controller.py              BFS controller
+├── dijkstra_osken_controller.py         Dijkstra controller
+├── dijkstra_multipath_osken_controller.py  Dijkstra + ECMP multipath
+├── astar_osken_controller.py            A* controller
+├── astar_multipath_osken_controller.py  A* + ECMP multipath
+├── bellman_ford_osken_controller.py     Bellman-Ford controller
+├── floyd_warshall_osken_controller.py   Floyd-Warshall controller
+├── widest_path_osken_controller.py      Widest-path (QoS) controller
+├── kshortest_osken_controller.py        Yen's K-shortest paths + ECMP
+│
+├── topo-spf_lab.py                      3-switch ring topology (basic lab)
+├── topo-ecmp_lab.py                     ECMP topology
+├── topo-weighted_lab.py                 6-switch topology with variable bandwidths
+├── topo-mesh_lab.py                     6-switch mesh for multipath demos
+│
+├── link_weights.json                    Per-link bandwidth for weighted controllers
+│
+├── tests/                               pytest test suite
+│   ├── conftest.py                      Shared graph fixtures
+│   ├── test_bfs.py
+│   ├── test_dijkstra.py
+│   ├── test_astar.py
+│   ├── test_bellman_ford.py
+│   ├── test_floyd_warshall.py
+│   ├── test_widest_path.py
+│   └── test_yen_k_shortest.py
+│
+└── docs/                                Teaching guides
+    ├── 00-overview.md                   Start here — lab structure and comparison table
+    ├── 01-sdn-concepts.md               SDN architecture background
+    ├── 03-bfs.md                        BFS walkthrough
+    ├── 04-dijkstra.md                   Dijkstra walkthrough
+    ├── 07-floyd-warshall.md             Floyd-Warshall and SDN global-view advantage
+    ├── 08-widest-path.md                QoS bandwidth routing
+    └── 09-ecmp.md                       ECMP and OpenFlow SELECT groups
 ```
-  Topologi Mininet ini memakai `autoSetMacs=True` (MAC host/switch terisi otomatis dan konsisten) dan `autoStaticArp=True` (setiap host otomatis punya ARP statis ke host lain) agar eksperimen fokus ke perilaku SPF, bukan isu alamat/MAC/ARP.
-2. Jalankan controller langsung dengan Python pada terminal console lainnya:
+
+---
+
+## Quick Start
+
+All labs require **two terminals** inside the container.
+
+### Terminal 1 — Start Mininet topology
+
+```bash
+# Basic 3-switch ring (works with all controllers):
+python3 SPF/topo-spf_lab.py
+
+# 6-switch weighted topology (for widest-path / Bellman-Ford):
+python3 SPF/topo-weighted_lab.py
+
+# Mesh topology (for ECMP / multipath controllers):
+python3 SPF/topo-mesh_lab.py
 ```
+
+### Terminal 2 — Start a controller
+
+```bash
+# Single-path controllers (any topology):
+python3 SPF/bfs_osken_controller.py
 python3 SPF/dijkstra_osken_controller.py
+python3 SPF/astar_osken_controller.py
+python3 SPF/bellman_ford_osken_controller.py
+python3 SPF/floyd_warshall_osken_controller.py
+
+# Weighted metric (requires link_weights.json):
+python3 SPF/widest_path_osken_controller.py
+
+# ECMP / multipath controllers:
+python3 SPF/dijkstra_multipath_osken_controller.py
+python3 SPF/astar_multipath_osken_controller.py
+python3 SPF/kshortest_osken_controller.py
 ```
-  Controller ini sudah mengaktifkan topology discovery internal OSKen, jadi tidak perlu menjalankan `osken-manager` secara manual.
 
-### Opsi Controller Multipath (ECMP)
+### Verify connectivity in Mininet CLI
 
-Selain controller single-path, tersedia dua controller multipath baru:
-
-- Dijkstra multipath (equal-cost multipath dari parent-set Dijkstra):
-  ```
-  python3 SPF/dijkstra_multipath_osken_controller.py
-  ```
-
-- A* multipath (equal-cost multipath dari parent-set A*):
-  ```
-  python3 SPF/astar_multipath_osken_controller.py
-  ```
-
-Keduanya memasang OpenFlow SELECT group pada ingress switch untuk load-sharing lintasan berbiaya sama.
-
-### Mode Menjalankan Controller (Normal vs Verbose)
-
-- Mode normal (cukup untuk praktikum dasar):
-  ```
-  python3 SPF/dijkstra_osken_controller.py
-  ```
-- Mode verbose (untuk melihat detail event dan debug path):
-  ```
-  python3 SPF/dijkstra_osken_controller.py --verbose
-  ```
-- Mode debug level eksplisit (lebih detail dari normal):
-  ```
-  python3 SPF/dijkstra_osken_controller.py --default-log-level 10
-  ```
-
-Catatan:
-- `--default-log-level 20` = INFO (default yang lebih ringkas).
-- `--default-log-level 10` = DEBUG (lebih ramai, cocok untuk analisis).
-- Saat controller dihentikan dengan `Ctrl+C`, exit code `130` adalah normal.
-
-Pada program `topo-spf_lab.py` akan membentuk topologi yang terdapat loopnya seperti tampak pada gambar topologi yang terdiri atas 6 hosts (h1 - h6) dan 3 switch (s1, s2, s3) dengan skenario sebagai berikut:
-![topology](/SPF/img/3sw6h_loop.jpg)
-- semua host (h1 - h6) harus dapat terhubung satu sama lain dan menggunakan jalur terpendek
-  ```
-  mininet> h1 ping h6
-  ```
-- ujicoba pemutusan salah satu jalur, semisal
-  ```
-  mininet> link s1 s3 down
-  mininet> h1 ping h6
-  ```
-Pada saat ping sebelum dan setelah `link s1 s3 down` amati path terpilih pada terminal yang menjalankan aplikasi dijkstra `python3 SPF/dijkstra_osken_controller.py`.
-Controller akan menghapus flow SPF lama dan memasang ulang flow baru ketika topologi berubah.
-Lakukan verifikasi pada tabel flow pada switch terkait apa saja yang berubah:
 ```
+mininet> pingall
+mininet> h1 ping h6
 mininet> dpctl dump-flows -O OpenFlow13
+mininet> dpctl dump-groups -O OpenFlow13    # for ECMP controllers
 ```
-Lakukan beberapa ujicoba dengan kombinasi host lainnya atau pun pemutusan jalur lainnya, dan amati apa yang tampil pada terminal console yang menjalankan `python3 SPF/dijkstra_osken_controller.py` atau pun pada terminal console yang menjalankan `python3 SPF/topo-spf_lab.py`.
 
-### Verifikasi Singkat
-1. Jalankan `h1 ping h6` dan pastikan ping berhasil setelah learning awal.
-2. Jalankan `link s1 s3 down`, lalu ulangi `h1 ping h6` dan pastikan trafik tetap jalan lewat jalur alternatif.
-3. Jalankan `link s1 s3 up`, lalu ulangi `h1 ping h6` untuk memastikan jalur kembali ke rute terpendek.
-4. Jika ingin melihat flow, jalankan `dpctl dump-flows -O OpenFlow13` pada switch yang relevan.
+---
 
-### Membaca Log dengan Cepat
+## Algorithm Comparison
 
-- `[HOST-LEARN]`: host baru terdeteksi atau berpindah port.
-- `[TOPO-CHANGE]`: ada perubahan link (up/down).
-- `[TOPO] refreshed topology`: controller selesai membaca snapshot topologi baru.
-- `[PKT-FWD]`: packet mendapatkan path dan diteruskan.
-- `[PKT-DROP]`: packet dibuang karena kondisi tertentu (misalnya belum ada path).
+| Controller                  | Algorithm       | O(…)              | Weights | ECMP |
+|-----------------------------|----------------|-------------------|---------|------|
+| bfs                         | BFS            | O(V+E)            | No      | No   |
+| dijkstra                    | Dijkstra       | O((V+E) log V)    | Yes     | No   |
+| dijkstra_multipath          | Dijkstra MP    | O((V+E) log V)    | No      | Yes  |
+| astar                       | A*             | O((V+E) log V)    | Yes     | No   |
+| astar_multipath             | A* MP          | O((V+E) log V)    | No      | Yes  |
+| bellman_ford                | Bellman-Ford   | O(V*E)            | Yes     | No   |
+| floyd_warshall              | Floyd-Warshall | O(V^3) pre-compute| Yes     | No   |
+| widest_path                 | Widest Path    | O((V+E) log V)    | Yes*    | No   |
+| kshortest                   | Yen's K-SP    | O(KV(E+V log V))  | No      | Yes  |
 
-Interpretasi praktis:
-- Jika setelah `link down` muncul `[TOPO-CHANGE]` lalu ping kembali normal, berarti convergence berjalan baik.
-- Jika drop muncul terus menerus, cek kembali topologi Mininet, status link, dan mode log DEBUG untuk detail.
+*widest_path requires `link_weights.json`; falls back to hop-count without it.
 
-### Troubleshooting Singkat
+---
 
-1. Ping awal gagal di percobaan pertama:
-  - Ulangi ping 2-3 kali, karena learning + flow install butuh warm-up.
-2. Tidak ada log topology change saat `link down/up`:
-  - Pastikan controller dijalankan dari file ini dan Mininet terhubung ke remote controller.
-3. Log terlalu ramai:
-  - Gunakan mode normal tanpa `--verbose`.
-4. Ingin diagnosa detail:
-  - Gunakan `--default-log-level 10`, lalu ulangi skenario `link down/up`.
+## Running Tests
 
-### Catatan Implementasi
-- LLDP dipakai oleh OSKen topology discovery untuk membangun link-state.
-- PacketIn dari LLDP tidak diproses oleh controller SPF karena itu bagian dari discovery, bukan forwarding data-plane.
-- Implementasi ini masih Mode 1: belum self-contained LLDP sender/receiver di aplikasi SPF.
+```bash
+cd SPF
+python3 -m pytest tests/ -v
+```
 
-### Roadmap
-Rencana pengembangan lanjutan didokumentasikan di `SPF/PLAN.md`.
+All 50 tests cover the pure-Python algorithm implementations.
 
+---
+
+## Logging
+
+All controllers use structured log tags for easy filtering:
+
+| Tag            | Meaning                                      |
+|----------------|----------------------------------------------|
+| `[HOST-LEARN]` | Host MAC discovered or moved to new switch   |
+| `[TOPO-CHANGE]`| Link up/down event                           |
+| `[TOPO] refreshed` | Topology snapshot rebuilt               |
+| `[PATH-QUERY]` | Path computation requested                   |
+| `[SPF-DONE]`   | Algorithm result logged                      |
+| `[FLOW-INSTALL]`| Flow rule installed on a switch             |
+| `[PKT-FWD]`    | Packet forwarded                             |
+| `[PKT-DROP]`   | Packet dropped (no path found)               |
+| `[ECMP-GROUP]` | SELECT group installed (multipath)           |
+
+Enable verbose logging with `--verbose` or `--default-log-level 10`.
+
+---
+
+## Simulating Link Failures
+
+In the Mininet CLI:
+
+```
+mininet> link s1 s3 down    # disable link between s1 and s3
+mininet> h1 ping h6          # observe rerouting
+mininet> link s1 s3 up      # restore link
+```
+
+The controller detects the topology change via LLDP, flushes affected flows,
+and reinstalls routes automatically.
+
+---
+
+## Class Structure (for Developers)
+
+```
+SPFBaseController (base_controller.py)
+  |- Topology discovery (LLDP via OSKen)
+  |- Host learning (MAC -> switch:port)
+  |- Flow installation / deletion
+  |- Broadcast tree flooding (BFS-based spanning tree)
+  |- Proactive route reinstallation after topology changes
+  |- Graceful shutdown
+
+  Abstract:  compute_path(src, dst, first_port, final_port)
+  Hook:      _on_topology_changed()   (optional — used by Floyd-Warshall)
+  Override:  install_path()           (optional — used by multipath)
+```
+
+See `docs/00-overview.md` for full documentation.
