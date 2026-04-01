@@ -18,6 +18,22 @@ python3 SPF/dijkstra_osken_controller.py
 ```
   Controller ini sudah mengaktifkan topology discovery internal OSKen, jadi tidak perlu menjalankan `osken-manager` secara manual.
 
+### Opsi Controller Multipath (ECMP)
+
+Selain controller single-path, tersedia dua controller multipath baru:
+
+- Dijkstra multipath (equal-cost multipath dari parent-set Dijkstra):
+  ```
+  python3 SPF/dijkstra_multipath_osken_controller.py
+  ```
+
+- A* multipath (equal-cost multipath dari parent-set A*):
+  ```
+  python3 SPF/astar_multipath_osken_controller.py
+  ```
+
+Keduanya memasang OpenFlow SELECT group pada ingress switch untuk load-sharing lintasan berbiaya sama.
+
 ### Mode Menjalankan Controller (Normal vs Verbose)
 
 - Mode normal (cukup untuk praktikum dasar):
