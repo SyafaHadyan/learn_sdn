@@ -78,6 +78,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     bc \
     git \
     procps \
+    bwm-ng \
     && rm -rf /tmp/* /var/tmp/*
 
 # Copy Mininet source from builder stage

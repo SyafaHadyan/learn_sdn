@@ -25,9 +25,6 @@
     },
     "1:4": {
       "bandwidth_mbps": 50
-    },
-    "3:5": {
-      "bandwidth_mbps": 200
     }
   }
 }

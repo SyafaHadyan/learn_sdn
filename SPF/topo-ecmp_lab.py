@@ -27,6 +27,7 @@ Both paths have equal cost → ECMP load-balances!
 from mininet.topo import Topo
 from mininet.net import Mininet
 from mininet.node import RemoteController
+from mininet.link import TCLink
 from mininet.util import dumpNodeConnections
 from mininet.log import setLogLevel, info
 from mininet.cli import CLI
@@ -66,13 +67,13 @@ class ECMP_Topology(Topo):
         self.addLink(s4, h3, port1=1, port2=1)
         self.addLink(s4, h4, port1=2, port2=1)
 
-        # Add links: switch to switch (diamond pattern with equal costs)
+        # Add links: switch to switch (diamond pattern, equal cost: 100 Mbps, 2ms, HFSC)
         info('*** Add Switch Links\n')
         # Create 2 equal-cost paths from s1 to s4 (both 3 hops)
-        self.addLink(s1, s2, port1=3, port2=1)  # Path 1 top edge
-        self.addLink(s1, s3, port1=4, port2=1)  # Path 2 bottom edge
-        self.addLink(s2, s4, port1=2, port2=3)  # Path 1 convergence
-        self.addLink(s3, s4, port1=2, port2=4)  # Path 2 convergence
+        self.addLink(s1, s2, port1=3, port2=1, bw=100, delay='2ms', use_hfsc=True)  # Path 1 top
+        self.addLink(s1, s3, port1=4, port2=1, bw=100, delay='2ms', use_hfsc=True)  # Path 2 bottom
+        self.addLink(s2, s4, port1=2, port2=3, bw=100, delay='2ms', use_hfsc=True)  # Path 1 converge
+        self.addLink(s3, s4, port1=2, port2=4, bw=100, delay='2ms', use_hfsc=True)  # Path 2 converge
 
 
 def run():
@@ -81,6 +82,7 @@ def run():
     net = Mininet(
         topo=topo,
         controller=RemoteController,
+        link=TCLink,
         autoSetMacs=True,
         autoStaticArp=True,
         waitConnected=True
