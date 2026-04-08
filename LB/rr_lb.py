@@ -250,3 +250,14 @@ class SimpleSwitch13(app_manager.OSKenApp):
         flow_mod2 = parser.OFPFlowMod(datapath=datapath, match=match, idle_timeout=7, instructions=inst2, cookie=cookie)
         datapath.send_msg(flow_mod2)
         print("<++++++++Reply sent from server: "+str(server_ip_selected)+", MAC: "+str(server_mac_selected)+". Via load balancer: "+str(self.virtual_lb_ip)+". To client: "+str(ip_header.src)+"++++++++>")
+
+if __name__ == '__main__':
+    import os
+    import sys
+
+    current_file = os.path.abspath(__file__)
+    passthrough_args = sys.argv[1:]
+    sys.argv = ['rr_lb', *passthrough_args, current_file]
+
+    from os_ken.cmd.manager import main
+    sys.exit(main())
