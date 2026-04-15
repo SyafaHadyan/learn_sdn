@@ -3,10 +3,10 @@
 from mininet.topo import Topo
 from mininet.net import Mininet
 from mininet.node import RemoteController
+from mininet.link import TCLink
 from mininet.util import dumpNodeConnections
 from mininet.log import setLogLevel, info
 from mininet.cli import CLI
-from functools import partial
 
 class MyTopo( Topo ):
     "Network topology with loops and suitable for finding Shortest Paths."
@@ -42,10 +42,10 @@ class MyTopo( Topo ):
         self.addLink( s2, h4, port1=2, port2=1 )
         self.addLink( s3, h5, port1=1, port2=1 )
         self.addLink( s3, h6, port1=2, port2=1 )
-        # Add links switch to switch
-        self.addLink( s1, s2, port1=3, port2=3 )
-        self.addLink( s2, s3, port1=4, port2=4 )
-        self.addLink( s3, s1, port1=3, port2=4 )
+        # Add links switch to switch (uniform: 100 Mbps, 2ms, HFSC)
+        self.addLink( s1, s2, port1=3, port2=3, bw=100, delay='2ms', use_hfsc=True )
+        self.addLink( s2, s3, port1=4, port2=4, bw=100, delay='2ms', use_hfsc=True )
+        self.addLink( s3, s1, port1=3, port2=4, bw=100, delay='2ms', use_hfsc=True )
     """
     The representation of the topology
     The value in () represent the port number in the switch
@@ -68,7 +68,7 @@ class MyTopo( Topo ):
 def run():
     "The Topology for Server - Round Robin LoadBalancing"
     topo = MyTopo()
-    net = Mininet( topo=topo, controller=RemoteController, autoSetMacs=True, autoStaticArp=True, waitConnected=True )
+    net = Mininet( topo=topo, controller=RemoteController, link=TCLink, autoSetMacs=True, autoStaticArp=True, waitConnected=True )
     
     info("\n***Disabling IPv6***\n")
     for host in net.hosts:
